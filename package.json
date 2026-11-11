@@ -1,6 +1,6 @@
 {
   "name": "losslesscut-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server that lets AI assistants like Claude drive LosslessCut through its local HTTP API",
   "type": "module",
   "bin": {

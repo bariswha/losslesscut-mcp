@@ -142,3 +142,14 @@ test('export reports failure and non-start', async () => {
   await mcp.close();
   await fake.close();
 });
+
+test('an action stuck behind a dialog times out with a clear message', async () => {
+  const http = await import('node:http');
+  const { createClient } = await import('../src/client.js');
+  const server = http.createServer(() => {});
+  await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+  const client = createClient({ port: server.address().port, actionTimeoutMs: 200 });
+  await assert.rejects(client.action('openFiles', ['/x.mp4']), /dialog/);
+  server.closeAllConnections();
+  await new Promise((resolve) => { server.close(resolve); });
+});

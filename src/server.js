@@ -8,7 +8,7 @@ import { createClient, LosslessCutError } from './client.js';
 import { parseTime, formatTimecode } from './timecode.js';
 
 export const SERVER_NAME = 'losslesscut-mcp';
-export const SERVER_VERSION = '1.0.0';
+export const SERVER_VERSION = '1.0.1';
 
 const MAX_FILES = 100;
 const MAX_PATH_LENGTH = 4096;
@@ -161,7 +161,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
   server.registerTool('open_files', {
     title: 'Open files',
     description: 'Opens one or more media files (or a .llc project file) in LosslessCut. Paths must be absolute paths the user gave you; never invent or guess paths. '
-      + 'Several files are loaded into the batch list.',
+      + 'Several files are loaded into the batch list. If a file is already open, LosslessCut asks the user what to do, so call close_file first.',
     inputSchema: {
       paths: z.array(z.string().min(1).max(MAX_PATH_LENGTH)).min(1).max(MAX_FILES).describe('Absolute file paths provided by the user'),
     },

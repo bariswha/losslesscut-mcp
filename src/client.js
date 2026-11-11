@@ -22,7 +22,7 @@ export function parsePort(value) {
   return port;
 }
 
-export function createClient({ port = DEFAULT_PORT, actionTimeoutMs = 120_000, request = http.request } = {}) {
+export function createClient({ port = DEFAULT_PORT, actionTimeoutMs = 30_000, request = http.request } = {}) {
   const baseUrl = `http://${HOST}:${port}`;
 
   const notReachable = () => new LosslessCutError(
@@ -106,7 +106,16 @@ export function createClient({ port = DEFAULT_PORT, actionTimeoutMs = 120_000, r
 
   async function action(name, body) {
     if (!/^[A-Za-z][A-Za-z0-9]{0,63}$/.test(name)) throw new LosslessCutError(`Invalid action name "${name}".`, 'INVALID_ACTION');
-    await send('POST', `/api/action/${name}`, { body, timeoutMs: actionTimeoutMs });
+    try {
+      await send('POST', `/api/action/${name}`, { body, timeoutMs: actionTimeoutMs });
+    } catch (err) {
+      if (err?.code !== 'TIMEOUT') throw err;
+      throw new LosslessCutError(
+        `LosslessCut did not finish "${name}" within ${Math.round(actionTimeoutMs / 1000)} s. It is probably waiting for the user in a dialog, `
+          + 'for example asking what to do because another file is already open. Ask the user to answer it in LosslessCut, or call close_file before open_files.',
+        'TIMEOUT',
+      );
+    }
   }
 
   async function awaitEvent(eventName, { timeoutMs, signal, onSent } = {}) {
