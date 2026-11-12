@@ -1,7 +1,7 @@
 {
   "name": "losslesscut-mcp",
-  "version": "1.0.1",
-  "description": "MCP server that lets AI assistants like Claude drive LosslessCut through its local HTTP API",
+  "version": "2.0.0",
+  "description": "MCP server that lets AI assistants like Claude see videos with FFmpeg and cut them with LosslessCut",
   "type": "module",
   "bin": {
     "losslesscut-mcp": "src/index.js"
@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/timecode.test.js test/server.test.js"
+    "test": "node --test test/timecode.test.js test/server.test.js test/analysis.test.js"
   },
   "keywords": [
     "mcp",
@@ -22,6 +22,8 @@
     "losslesscut",
     "video",
     "ffmpeg",
+    "scene-detection",
+    "video-analysis",
     "claude",
     "ai"
   ],

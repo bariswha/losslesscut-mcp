@@ -68,13 +68,15 @@ export async function startFakeLosslessCut({ exportConfirm = true, exportPaths =
   };
 }
 
-export async function connect({ port, statFn }) {
+export async function connect({ port, statFn, ...options }) {
   const server = createLosslessCutServer({
     client: createClient({ port, actionTimeoutMs: 5000 }),
     statFn,
     eventListenDelayMs: 20,
     settleDelayMs: 0,
     exportStartTimeoutMs: 500,
+    projectLoadDelayMs: 0,
+    ...options,
   });
   const client = new Client({ name: 'test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

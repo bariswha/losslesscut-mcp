@@ -2,6 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { createClient, DEFAULT_PORT, parsePort } from './client.js';
+import { readDisabledTools } from './config.js';
 import { createLosslessCutServer, SERVER_VERSION } from './server.js';
 
 const HELP = `losslesscut-mcp ${SERVER_VERSION}
@@ -10,9 +11,11 @@ MCP server (stdio) that controls LosslessCut through its local HTTP API.
 Start LosslessCut with: LosslessCut --http-api [port]
 
 Options:
-  --port <n>   Port of the LosslessCut HTTP API (default ${DEFAULT_PORT}, or LOSSLESSCUT_PORT)
-  --help       Show this help
-  --version    Show the version
+  --port <n>              Port of the LosslessCut HTTP API (default ${DEFAULT_PORT}, or LOSSLESSCUT_PORT)
+  --no-frames             Turn off frame viewing (view_frames, contact_sheet), or LOSSLESSCUT_MCP_FRAMES=off
+  --disable-tools <list>  Comma separated tool names to turn off, or LOSSLESSCUT_MCP_DISABLE_TOOLS
+  --help                  Show this help
+  --version               Show the version
 `;
 
 function readPort(argv, env) {
@@ -35,7 +38,8 @@ async function main() {
     return;
   }
   const port = readPort(argv, process.env);
-  const server = createLosslessCutServer({ client: createClient({ port }) });
+  const disabledTools = readDisabledTools(argv, process.env);
+  const server = createLosslessCutServer({ client: createClient({ port }), disabledTools });
   await server.connect(new StdioServerTransport());
   process.stderr.write(`losslesscut-mcp ${SERVER_VERSION} ready, LosslessCut API at http://127.0.0.1:${port}\n`);
 }

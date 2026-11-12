@@ -13,8 +13,10 @@ test('lists all tools', async () => {
   const mcp = await connect({ port: fake.port, statFn: fileStat });
   const { tools } = await mcp.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'add_segment', 'check_connection', 'close_file', 'export_file', 'jump_to_segment', 'list_actions',
-    'open_files', 'run_action', 'seek', 'select_segments', 'set_cut_points', 'wait_for_export',
+    'add_segment', 'audio_levels', 'check_connection', 'check_tools', 'close_file', 'contact_sheet',
+    'detect_black', 'detect_scenes', 'detect_silence', 'export_file', 'jump_to_segment', 'keyframes', 'list_actions',
+    'media_info', 'open_files', 'run_action', 'seek', 'select_segments', 'set_cut_points', 'set_segments',
+    'view_frames', 'wait_for_export',
   ]);
   await mcp.close();
   await fake.close();

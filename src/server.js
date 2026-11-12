@@ -1,69 +1,22 @@
 import { stat } from 'node:fs/promises';
-import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { ACTION_GROUPS, ACTION_GROUP_BY_NAME, GROUP_DESCRIPTIONS, isAllowedAction } from './actions.js';
-import { createClient, LosslessCutError } from './client.js';
+import { registerAnalysisTools } from './analysisTools.js';
+import { createClient } from './client.js';
+import { createMedia } from './media.js';
+import { writeProject } from './project.js';
 import { parseTime, formatTimecode } from './timecode.js';
+import { failure, guarded, json, MAX_FILES, MAX_PATH_LENGTH, pathSchema, sleep, text, timeSchema, validateFilePath, validateFilePaths } from './tooling.js';
 
 export const SERVER_NAME = 'losslesscut-mcp';
-export const SERVER_VERSION = '1.0.1';
+export const SERVER_VERSION = '2.0.0';
 
-const MAX_FILES = 100;
-const MAX_PATH_LENGTH = 4096;
 const EVENT_LISTEN_DELAY_MS = 250;
 const SETTLE_DELAY_MS = 150;
 
 const NO_FEEDBACK_NOTE = 'LosslessCut does not report the result of actions over its HTTP API, so check the LosslessCut window if something looks wrong.';
-
-const timeSchema = z.union([
-  z.number().min(0).describe('Seconds from the start of the file'),
-  z.string().min(1).max(32).describe('Timecode like "75.5", "01:15.5" or "00:01:15.500"'),
-]);
-
-const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
-
-const text = (message) => ({ content: [{ type: 'text', text: message }] });
-const json = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] });
-const failure = (message) => ({ content: [{ type: 'text', text: message }], isError: true });
-
-function errorMessage(err) {
-  if (err instanceof LosslessCutError || err instanceof RangeError || err instanceof TypeError) return err.message;
-  return `Unexpected error: ${err?.message ?? String(err)}`;
-}
-
-function guarded(handler) {
-  return async (args, extra) => {
-    try {
-      return await handler(args ?? {}, extra);
-    } catch (err) {
-      return failure(errorMessage(err));
-    }
-  };
-}
-
-async function validateFilePaths(paths, { statFn = stat } = {}) {
-  const resolved = [];
-  for (const raw of paths) {
-    if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_PATH_LENGTH || /[\0\r\n]/.test(raw)) {
-      throw new RangeError('Each path must be a non-empty string without control characters.');
-    }
-    if (!path.isAbsolute(raw)) {
-      throw new RangeError(`"${raw}" is not an absolute path. Ask the user for the full path of the file instead of guessing it.`);
-    }
-    const normalized = path.normalize(raw);
-    let info;
-    try {
-      info = await statFn(normalized);
-    } catch {
-      throw new RangeError(`File not found: ${normalized}. Ask the user for the correct path.`);
-    }
-    if (!info.isFile()) throw new RangeError(`Not a file: ${normalized}`);
-    resolved.push(normalized);
-  }
-  return resolved;
-}
 
 function withTimeout(promise, ms) {
   let timer;
@@ -80,15 +33,31 @@ function describeExportResult(result) {
   return failure('Export finished without output files. It failed or was cancelled; check the LosslessCut window for details.');
 }
 
-export function createLosslessCutServer({ client = createClient(), statFn = stat, eventListenDelayMs = EVENT_LISTEN_DELAY_MS, settleDelayMs = SETTLE_DELAY_MS, exportStartTimeoutMs = 3000 } = {}) {
+export function createLosslessCutServer({
+  client = createClient(),
+  statFn = stat,
+  media: mediaTools = createMedia(),
+  disabledTools = [],
+  eventListenDelayMs = EVENT_LISTEN_DELAY_MS,
+  settleDelayMs = SETTLE_DELAY_MS,
+  exportStartTimeoutMs = 3000,
+  projectLoadDelayMs = 1500,
+} = {}) {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
-      instructions: 'Controls a running LosslessCut desktop app through its local HTTP API. '
-        + 'LosslessCut must be started with --http-api. Typical flow: open_files, then add_segment or set_cut_points, then export_file. '
-        + 'Only use file paths the user gave you. The API cannot read app state (open file, segments, playhead), so keep track of what you did.',
+      instructions: 'Controls a running LosslessCut desktop app through its local HTTP API, and analyses media files locally with FFmpeg. '
+        + 'LosslessCut must be started with --http-api. Only use file paths the user gave you. '
+        + 'To find what to cut, look at the media first: media_info, contact_sheet or view_frames to see it, detect_scenes, detect_silence, detect_black, audio_levels and keyframes. '
+        + 'Then cut: set_segments loads exact segments in one step (preferred), or use add_segment/set_cut_points. Then export_file. '
+        + 'The LosslessCut API cannot read app state (open file, segments, playhead), so keep track of what you did.',
     },
   );
+
+  const disabled = new Set(disabledTools);
+  const tool = (name, config, handler) => {
+    if (!disabled.has(name)) server.registerTool(name, config, handler);
+  };
 
   const exportState = { pending: null, last: null };
 
@@ -148,7 +117,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     await sleep(settleDelayMs);
   }
 
-  server.registerTool('check_connection', {
+  tool('check_connection', {
     title: 'Check LosslessCut connection',
     description: 'Checks that LosslessCut is running with its HTTP API enabled and reachable on 127.0.0.1.',
     inputSchema: {},
@@ -158,7 +127,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text(`LosslessCut HTTP API is reachable at ${url}.`);
   }));
 
-  server.registerTool('open_files', {
+  tool('open_files', {
     title: 'Open files',
     description: 'Opens one or more media files (or a .llc project file) in LosslessCut. Paths must be absolute paths the user gave you; never invent or guess paths. '
       + 'Several files are loaded into the batch list. If a file is already open, LosslessCut asks the user what to do, so call close_file first.',
@@ -173,7 +142,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text(`Asked LosslessCut to open ${files.length} file(s):\n${files.join('\n')}`);
   }));
 
-  server.registerTool('seek', {
+  tool('seek', {
     title: 'Seek to time',
     description: 'Moves the playhead of the open file to a time. Works with the default "timecode with decimal fraction" timecode format in LosslessCut.',
     inputSchema: { time: timeSchema },
@@ -183,7 +152,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text(`Playhead moved to ${formatTimecode(seconds)}.`);
   }));
 
-  server.registerTool('set_cut_points', {
+  tool('set_cut_points', {
     title: 'Set cut start/end',
     description: 'Sets the start and/or end of the current segment by seeking to each time and pressing "set cut start"/"set cut end". '
       + 'If the playhead is after the current segment, LosslessCut creates a new segment instead.',
@@ -209,7 +178,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text(`Set cut ${done.join(' and ')}. ${NO_FEEDBACK_NOTE}`);
   }));
 
-  server.registerTool('add_segment', {
+  tool('add_segment', {
     title: 'Add segment',
     description: 'Adds a new segment from start to end. If the file only has its initial full-length segment, LosslessCut replaces it with this one. '
       + 'Call it several times to cut out several parts.',
@@ -238,7 +207,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     at_playhead: 'selectSegmentsAtCursor',
   };
 
-  server.registerTool('select_segments', {
+  tool('select_segments', {
     title: 'Select segments',
     description: 'Changes which segments are selected. Only selected segments are exported.',
     inputSchema: { mode: z.enum(Object.keys(selectModes)) },
@@ -255,7 +224,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     previous: 'jumpSeekPrevSegment',
   };
 
-  server.registerTool('jump_to_segment', {
+  tool('jump_to_segment', {
     title: 'Jump to segment',
     description: 'Makes another segment the current one and moves the playhead to its start.',
     inputSchema: { target: z.enum(Object.keys(jumpTargets)) },
@@ -265,7 +234,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text(`Ran ${jumpTargets[target]}.`);
   }));
 
-  server.registerTool('export_file', {
+  tool('export_file', {
     title: 'Export',
     description: 'Exports the selected segments of the open file with the current LosslessCut export settings. '
       + 'If the export options dialog is enabled, it is confirmed automatically. Returns the output paths when wait is true.',
@@ -297,7 +266,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return waitForExport(timeoutSeconds);
   }));
 
-  server.registerTool('wait_for_export', {
+  tool('wait_for_export', {
     title: 'Wait for export',
     description: 'Waits until the current or next export finishes and returns the exported file paths.',
     inputSchema: {
@@ -306,7 +275,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, guarded(async ({ timeoutSeconds = 300 }) => waitForExport(timeoutSeconds)));
 
-  server.registerTool('close_file', {
+  tool('close_file', {
     title: 'Close file',
     description: 'Closes the current file in LosslessCut. If "ask before closing" is enabled in its settings, the user has to confirm in the app.',
     inputSchema: {},
@@ -316,7 +285,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return text('Asked LosslessCut to close the current file.');
   }));
 
-  server.registerTool('list_actions', {
+  tool('list_actions', {
     title: 'List actions',
     description: 'Lists the LosslessCut keyboard actions that run_action accepts, grouped by category.',
     inputSchema: {
@@ -328,7 +297,7 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     return json(Object.fromEntries(groups.map((g) => [g, { description: GROUP_DESCRIPTIONS[g], actions: ACTION_GROUPS[g] }])));
   }));
 
-  server.registerTool('run_action', {
+  tool('run_action', {
     title: 'Run action',
     description: 'Runs one LosslessCut keyboard action by name, for example "togglePlayResetSpeed", "splitCurrentSegment" or "toggleStripAudio". '
       + 'Only actions from list_actions are allowed. Actions in the "dialog" group open a dialog the user must complete in the app.',
@@ -344,6 +313,53 @@ export function createLosslessCutServer({ client = createClient(), statFn = stat
     const note = ACTION_GROUP_BY_NAME.get(action) === 'dialog' ? ' It opens a dialog in LosslessCut that the user has to complete.' : '';
     return text(`Ran ${action}.${note} ${NO_FEEDBACK_NOTE}`);
   }));
+
+  tool('set_segments', {
+    title: 'Set segments',
+    description: 'Loads an exact list of segments for a media file in one step and opens it in LosslessCut. It writes the LosslessCut project file next to the media ("<name>-proj.llc"); '
+      + 'an existing project file is first renamed to a .bak backup. The currently open file is closed first. Prefer this over add_segment for precise cuts.',
+    inputSchema: {
+      path: pathSchema,
+      segments: z.array(z.object({
+        start: timeSchema,
+        end: timeSchema,
+        name: z.string().max(200).optional(),
+        selected: z.boolean().optional(),
+      })).min(1).max(1000),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, guarded(async ({ path: file, segments }) => {
+    const media = await validateFilePath(file, { statFn });
+    const parsed = segments.map((s, i) => {
+      const start = parseTime(s.start);
+      const end = parseTime(s.end);
+      if (end <= start) throw new RangeError(`Segment ${i + 1}: end must be after start.`);
+      return { start, end, name: s.name?.replace(/[\u0000-\u001f]/g, ' '), selected: s.selected };
+    });
+    let total;
+    try {
+      total = await mediaTools.duration(media);
+    } catch {}
+    if (total != null) {
+      const bad = parsed.findIndex((s) => s.start >= total);
+      if (bad !== -1) throw new RangeError(`Segment ${bad + 1} starts after the end of the file (${total.toFixed(3)} s).`);
+      for (const s of parsed) s.end = Math.min(s.end, total);
+    }
+    await runAction('closeCurrentFile');
+    await sleep(Math.max(settleDelayMs, 300));
+    const project = await writeProject(media, parsed);
+    await client.action('openFiles', [media]);
+    await sleep(projectLoadDelayMs);
+    return json({
+      status: 'loaded',
+      segments: parsed.length,
+      projectFile: project.path,
+      ...(project.backup ? { previousProjectBackup: project.backup } : {}),
+      note: NO_FEEDBACK_NOTE,
+    });
+  }));
+
+  registerAnalysisTools({ tool, media: mediaTools, statFn });
 
   return server;
 }
