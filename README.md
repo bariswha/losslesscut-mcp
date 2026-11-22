@@ -45,6 +45,9 @@ These run locally with FFmpeg and work on any file, with or without LosslessCut 
 | `select_segments` / `jump_to_segment` | Selection and navigation |
 | `export_file` | Exports the selected segments, confirms the export dialog, returns the output paths |
 | `wait_for_export` | Waits for a running export and returns its output paths |
+| `batch_export` | Exports segments from multiple files in one call, file by file |
+| `subtitle_to_segments` | Reads an SRT or WebVTT file and loads the lines matching a search string as segments |
+| `get_state` | Returns what this server session last told LosslessCut to open and load |
 | `close_file` | Closes the current file |
 | `list_actions` / `run_action` | 135 allowlisted LosslessCut keyboard actions, such as `splitCurrentSegment` or `toggleStripAudio` |
 
@@ -117,6 +120,8 @@ node src/index.js --port 8080
 - "Cut out the silent pauses longer than a second and export the rest as one file."
 - "Find the loudest moments, make a 20 second segment around each and export them."
 - "Keep 0:02–0:05 and 0:07–0:09.5, name them intro and demo, and export."
+- "Load `D:\Videos\talk.srt` and cut out every line where someone says 'thank you'."
+- "Export the first three minutes from each file in D:\Videos\clips\ as separate files."
 
 Give the assistant full file paths. It is told never to guess them, and every tool rejects relative paths and files that don't exist.
 
@@ -153,7 +158,7 @@ See [SECURITY.md](SECURITY.md).
 
 These come from LosslessCut's experimental HTTP API:
 
-- **No read access.** The API can't report the open file, the segments or the playhead, so the assistant keeps track of what it did. The analysis tools read the file itself, not the app.
+- **No read access.** The API can't report the open file, the segments or the playhead. `get_state` returns what this server session last told LosslessCut to load, which is useful when you lose track mid-session, but it won't reflect changes you made in the app directly.
 - **No error feedback.** An action that fails inside LosslessCut still returns success over HTTP.
 - **Dialogs.** If LosslessCut opens a dialog (for example when a file is already open), the action waits for you; the server reports that after 30 seconds. Actions in the `dialog` group of `list_actions` always open one.
 - **Timecode format.** `seek` sends `hh:mm:ss.fff`, which LosslessCut parses with its default timecode format. If you switched it to frames or seconds, use `set_segments` instead.

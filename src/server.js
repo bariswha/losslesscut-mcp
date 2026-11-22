@@ -1,4 +1,5 @@
 import { stat } from 'node:fs/promises';
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
@@ -7,11 +8,12 @@ import { registerAnalysisTools } from './analysisTools.js';
 import { createClient } from './client.js';
 import { createMedia } from './media.js';
 import { writeProject } from './project.js';
+import { loadSubtitles, matchSubtitles } from './subtitle.js';
 import { parseTime, formatTimecode } from './timecode.js';
 import { failure, guarded, json, MAX_FILES, MAX_PATH_LENGTH, pathSchema, sleep, text, timeSchema, validateFilePath, validateFilePaths } from './tooling.js';
 
 export const SERVER_NAME = 'losslesscut-mcp';
-export const SERVER_VERSION = '2.0.0';
+export const SERVER_VERSION = '2.1.0';
 
 const EVENT_LISTEN_DELAY_MS = 250;
 const SETTLE_DELAY_MS = 150;
@@ -60,6 +62,7 @@ export function createLosslessCutServer({
   };
 
   const exportState = { pending: null, last: null };
+  const assistantState = { openFile: null, segments: null, segmentCount: null };
 
   async function listen(eventName, { signal } = {}) {
     let sent;
@@ -139,6 +142,9 @@ export function createLosslessCutServer({
     const files = await validateFilePaths(paths, { statFn });
     await client.action('openFiles', files);
     await sleep(settleDelayMs);
+    assistantState.openFile = files[0];
+    assistantState.segments = null;
+    assistantState.segmentCount = null;
     return text(`Asked LosslessCut to open ${files.length} file(s):\n${files.join('\n')}`);
   }));
 
@@ -282,6 +288,9 @@ export function createLosslessCutServer({
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, guarded(async () => {
     await runAction('closeCurrentFile');
+    assistantState.openFile = null;
+    assistantState.segments = null;
+    assistantState.segmentCount = null;
     return text('Asked LosslessCut to close the current file.');
   }));
 
@@ -350,6 +359,9 @@ export function createLosslessCutServer({
     const project = await writeProject(media, parsed);
     await client.action('openFiles', [media]);
     await sleep(projectLoadDelayMs);
+    assistantState.openFile = media;
+    assistantState.segments = parsed.map((s) => ({ start: s.start, end: s.end, ...(s.name ? { name: s.name } : {}), selected: s.selected ?? true }));
+    assistantState.segmentCount = parsed.length;
     return json({
       status: 'loaded',
       segments: parsed.length,
@@ -357,6 +369,161 @@ export function createLosslessCutServer({
       ...(project.backup ? { previousProjectBackup: project.backup } : {}),
       note: NO_FEEDBACK_NOTE,
     });
+  }));
+
+  tool('get_state', {
+    title: 'Get assistant state',
+    description: 'Returns what this server session last sent to LosslessCut: the open file path, the loaded segments and their count. '
+      + 'This is what the server told LosslessCut to do, not what LosslessCut currently shows — the LosslessCut HTTP API has no read access. '
+      + 'Returns null for each field that has not been set in this session.',
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, guarded(async () => json({
+    openFile: assistantState.openFile,
+    segmentCount: assistantState.segmentCount,
+    segments: assistantState.segments,
+    note: 'This reflects what this server session last instructed LosslessCut to load. If you opened or changed segments in the app directly, this will not match.',
+  })));
+
+  tool('subtitle_to_segments', {
+    title: 'Subtitle to segments',
+    description: 'Reads an SRT or WebVTT subtitle file and returns segments whose text matches a search string. '
+      + 'Optionally loads them into LosslessCut for the matching media file. '
+      + 'Useful for cutting out every line where someone says a word or phrase.',
+    inputSchema: {
+      subtitlePath: pathSchema.describe('Absolute path to an .srt or .vtt subtitle file'),
+      query: z.string().min(1).max(500).describe('Text to search for in the subtitle lines'),
+      caseSensitive: z.boolean().default(false),
+      padSeconds: z.number().min(0).max(30).default(0).describe('Seconds to add before and after each matching subtitle line'),
+      load: z.boolean().default(false).describe('If true, also call set_segments to load the matches into LosslessCut (requires mediaPath)'),
+      mediaPath: pathSchema.optional().describe('Absolute path to the media file, required when load is true'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, guarded(async ({ subtitlePath, query, caseSensitive = false, padSeconds = 0, load = false, mediaPath }) => {
+    const subFile = await validateFilePath(subtitlePath, { statFn });
+    const entries = await loadSubtitles(subFile);
+    const matches = matchSubtitles(entries, { query, caseSensitive, pad: padSeconds });
+    if (matches.length === 0) {
+      return failure(`No subtitle lines matching "${query}" were found in ${subFile}.`);
+    }
+    const segments = matches.map((m) => ({
+      start: m.start,
+      end: m.end,
+      name: m.text.slice(0, 100),
+    }));
+    if (!load) {
+      return json({ matches: segments.length, segments });
+    }
+    if (!mediaPath) {
+      return failure('mediaPath is required when load is true.');
+    }
+    const media = await validateFilePath(mediaPath, { statFn });
+    // reuse set_segments logic inline rather than duplicating the tool registration
+    const parsed = segments.map((s, i) => {
+      const start = parseTime(s.start);
+      const end = parseTime(s.end);
+      if (end <= start) throw new RangeError(`Segment ${i + 1}: end must be after start.`);
+      return { start, end, name: s.name };
+    });
+    let total;
+    try {
+      total = await mediaTools.duration(media);
+    } catch {}
+    if (total != null) {
+      const bad = parsed.findIndex((s) => s.start >= total);
+      if (bad !== -1) throw new RangeError(`Segment ${bad + 1} starts after the end of the file (${total.toFixed(3)} s).`);
+      for (const s of parsed) s.end = Math.min(s.end, total);
+    }
+    await runAction('closeCurrentFile');
+    await sleep(Math.max(settleDelayMs, 300));
+    const project = await writeProject(media, parsed);
+    await client.action('openFiles', [media]);
+    await sleep(projectLoadDelayMs);
+    assistantState.openFile = media;
+    assistantState.segments = parsed.map((s) => ({ start: s.start, end: s.end, name: s.name }));
+    assistantState.segmentCount = parsed.length;
+    return json({
+      status: 'loaded',
+      matches: parsed.length,
+      segments: parsed,
+      projectFile: project.path,
+      ...(project.backup ? { previousProjectBackup: project.backup } : {}),
+      note: NO_FEEDBACK_NOTE,
+    });
+  }));
+
+  tool('batch_export', {
+    title: 'Batch export',
+    description: 'Exports segments from multiple files one after another. Each item specifies a file path and its segments; '
+      + 'this tool calls set_segments and export_file for each in turn and collects all output paths. '
+      + 'Use this instead of calling set_segments + export_file in a loop yourself.',
+    inputSchema: {
+      items: z.array(z.object({
+        path: pathSchema,
+        segments: z.array(z.object({
+          start: timeSchema,
+          end: timeSchema,
+          name: z.string().max(200).optional(),
+          selected: z.boolean().optional(),
+        })).min(1).max(1000),
+      })).min(1).max(50).describe('Files to process, in order'),
+      timeoutSeconds: z.number().int().min(1).max(3600).default(300).describe('Per-file export timeout in seconds'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, guarded(async ({ items, timeoutSeconds = 300 }) => {
+    const results = [];
+    for (const item of items) {
+      const media = await validateFilePath(item.path, { statFn });
+      const parsed = item.segments.map((s, i) => {
+        const start = parseTime(s.start);
+        const end = parseTime(s.end);
+        if (end <= start) throw new RangeError(`${media} segment ${i + 1}: end must be after start.`);
+        return { start, end, name: s.name?.replace(/[\u0000-\u001f]/g, ' '), selected: s.selected };
+      });
+      let total;
+      try {
+        total = await mediaTools.duration(media);
+      } catch {}
+      if (total != null) {
+        const bad = parsed.findIndex((s) => s.start >= total);
+        if (bad !== -1) throw new RangeError(`${path.basename(media)} segment ${bad + 1} starts after the end of the file (${total.toFixed(3)} s).`);
+        for (const s of parsed) s.end = Math.min(s.end, total);
+      }
+      await runAction('closeCurrentFile');
+      await sleep(Math.max(settleDelayMs, 300));
+      const project = await writeProject(media, parsed);
+      await client.action('openFiles', [media]);
+      await sleep(projectLoadDelayMs);
+      assistantState.openFile = media;
+      assistantState.segments = parsed.map((s) => ({ start: s.start, end: s.end, ...(s.name ? { name: s.name } : {}), selected: s.selected ?? true }));
+      assistantState.segmentCount = parsed.length;
+      // set up export listener before triggering export
+      exportState.last = null;
+      await ensureExportListener();
+      const startController = new AbortController();
+      const { promise: started } = await listen('export-start', { signal: startController.signal });
+      try {
+        await client.action('export');
+        let start = await withTimeout(started, exportStartTimeoutMs);
+        if (!start.done) {
+          await client.action('export');
+          start = await withTimeout(started, exportStartTimeoutMs);
+        }
+        if (!start.done) {
+          cancelExportListener();
+          throw new Error(`Export did not start for ${path.basename(media)}. Make sure LosslessCut has no dialog open.`);
+        }
+      } finally {
+        startController.abort();
+      }
+      const outcome = await withTimeout(exportState.pending?.promise ?? Promise.resolve({}), timeoutSeconds * 1000);
+      exportState.last = null;
+      if (!outcome.done) throw new Error(`Export timed out after ${timeoutSeconds} s for ${path.basename(media)}.`);
+      const { paths } = outcome.value ?? {};
+      if (!Array.isArray(paths) || paths.length === 0) throw new Error(`Export finished without output files for ${path.basename(media)}.`);
+      results.push({ input: media, projectFile: project.path, outputPaths: paths });
+    }
+    return json({ exported: results.length, results });
   }));
 
   registerAnalysisTools({ tool, media: mediaTools, statFn });
